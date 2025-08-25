@@ -141,7 +141,7 @@ def get_next_external_id() -> str:
     next_num = (row[0] or 0) + 1
     return f"TC-{next_num}"
 
-def upsert_user(name: str, role: str):(name: str, role: str):
+def upsert_user(name: str, role: str):
     conn = get_conn()
     cur = conn.cursor()
     try:
