@@ -141,6 +141,7 @@ def get_next_external_id() -> str:
     next_num = (row[0] or 0) + 1
     return f"TC-{next_num}"
 
+
 def upsert_user(name: str, role: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -162,10 +163,12 @@ def list_users():
     return rows
 
 
-def get_user_id_by_name(name: str) -> Optional[int]:
+def role_of(user_id: Optional[int]) -> Optional[str]:
+    if user_id is None:
+        return None
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE name=?", (name,))
+    cur.execute("SELECT role FROM users WHERE id=?", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
@@ -195,12 +198,11 @@ def list_sessions(include_closed=True):
 
 
 def close_session(session_id: int) -> bool:
-    """New rule: a session can be closed if each test case has at least one PASSED run in this session.
+    """Rule: a session can be closed if each test case has at least one PASSED run in this session.
     Failed runs do not block closure if a pass exists for that test case.
     """
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT COUNT(*)
@@ -228,7 +230,6 @@ def add_test_case(title: str, steps: List[str], expected: str, category: str, au
     cur = conn.cursor()
     steps_json = json.dumps(steps)
     external_id = get_next_external_id()
-
     cur.execute(
         """
         INSERT INTO test_cases(external_id, title, steps_json, expected_result, category, author_id)
@@ -239,17 +240,6 @@ def add_test_case(title: str, steps: List[str], expected: str, category: str, au
     conn.commit()
     conn.close()
     return external_id
-        raise ValueError(f"Test case ID '{external_id}' already exists.")
-
-    cur.execute(
-        """
-        INSERT INTO test_cases(external_id, title, steps_json, expected_result, category, author_id)
-        VALUES (?,?,?,?,?,?)
-        """,
-        (external_id.strip(), title.strip(), steps_json, expected.strip(), category, author_id),
-    )
-    conn.commit()
-    conn.close()
 
 
 def list_test_cases():
@@ -328,7 +318,7 @@ def counts_for_session(session_id: int):
     cur.execute("SELECT COUNT(*) FROM test_runs WHERE session_id=? AND status='failed'", (session_id,))
     failed_runs = cur.fetchone()[0]
 
-    # to be executed = test_cases without a *passed* run in this session (per new rule)
+    # to be executed = test_cases without a *passed* run in this session (per rule)
     cur.execute(
         """
         SELECT COUNT(*) FROM test_cases tc
@@ -396,17 +386,6 @@ def require_current_user():
     return name_to_id[selected]
 
 
-def role_of(user_id: Optional[int]) -> Optional[str]:
-    if user_id is None:
-        return None
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT role FROM users WHERE id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
 # ---------------------------
 # Pages
 # ---------------------------
@@ -422,20 +401,6 @@ def page_overview():
         - **Run Tests**: Select a case, provide a URL, choose phase (**FT / SIT / UAT**), set status (**passed / failed**), and add an optional comment.
         - **Failures** *(test leads)*: Review failed runs and classify them as **minor / major / critical** (reporting only).
         - **Dashboard**: See totals and a live list of test cases that **still need a PASS** this session, and run them directly from there.
-        - **Sessions**: Create a test session and close it once **every test case has at least one PASSED run** in that session.
-
-        Use the sidebar to select your **user** and the **active session**.
-        """
-    )
-    st.markdown(
-        """
-        **What you can do here**
-
-        - **Users**: Add testers and test leads.
-        - **Test Cases** *(test leads)*: Create cases with a unique **Test Case ID** (e.g. `TC-1`), up to five steps, expected result, and category (**integration** or **studio**).
-        - **Run Tests**: Select a case, provide a URL, choose phase (**FT / SIT / UAT**), set status (**passed / failed**), and add an optional comment.
-        - **Failures** *(test leads)*: Review failed runs and classify them as **minor / major / critical** (for reporting only).
-        - **Dashboard**: See totals for the selected session: *all runs*, *failed runs*, and *to be executed* (cases without a **passed** run in the session).
         - **Sessions**: Create a test session and close it once **every test case has at least one PASSED run** in that session.
 
         Use the sidebar to select your **user** and the **active session**.
@@ -544,7 +509,7 @@ def page_test_cases(current_user_id: Optional[int]):
         st.info("No test cases yet.")
     else:
         for (tc_pk, ext_id, title, category, expected, steps_json, author) in rows:
-            with st.container(border=True):
+            with st.container():
                 st.markdown(f"**[{ext_id or tc_pk}] {title}** — _{category}_  ")
                 steps = json.loads(steps_json)
                 for i, s in enumerate(steps, start=1):
@@ -565,7 +530,6 @@ def page_run_tests(current_user_id: Optional[int], active_session_id: Optional[i
         return
 
     with st.form("run_form"):
-        # show external IDs in the picker
         tc_options = {f"[{r[1] or r[0]}] {r[2]} ({r[3]})": r[0] for r in rows}
         tc_label = st.selectbox("Test Case", options=list(tc_options.keys()))
         url = st.text_input("URL under test")
@@ -594,7 +558,7 @@ def page_run_tests(current_user_id: Optional[int], active_session_id: Optional[i
     st.subheader("Recent Runs (this session)")
     for row in list_test_runs(session_id=active_session_id):
         (run_id, tc_id, sess_id, url, phase, status, comment, created_at, title, tc_cat, runner, severity, ext_id) = row
-        with st.container(border=True):
+        with st.container():
             st.markdown(f"**Run #{run_id}** — {created_at[:19].replace('T',' ')}  ")
             st.markdown(f"**TC [{ext_id or tc_id}]** {title} _({tc_cat})_  ")
             st.markdown(f"Phase: **{phase}** | Status: **{status.upper()}** | URL: {url}")
@@ -620,7 +584,7 @@ def page_failures(current_user_id: Optional[int], active_session_id: Optional[in
 
     for row in rows:
         (run_id, tc_id, sess_id, url, phase, status, comment, created_at, title, tc_cat, runner, severity, ext_id) = row
-        with st.container(border=True):
+        with st.container():
             st.markdown(f"**Run #{run_id}** — {created_at[:19].replace('T',' ')} | TC [{ext_id or tc_id}] {title} ({tc_cat}) | Runner: {runner or '—'}")
             st.markdown(f"URL: {url} | Phase: {phase}")
             if comment:
@@ -642,7 +606,7 @@ def page_failures(current_user_id: Optional[int], active_session_id: Optional[in
                         st.error(f"Failed to save: {e}")
 
 
-def page_dashboard(active_session_id: Optional[int]):
+def page_dashboard(active_session_id: Optional[int], current_user_id: Optional[int]):
     st.title("Dashboard")
     if active_session_id is None:
         st.error("Select or create an active session in the sidebar first.")
@@ -675,18 +639,12 @@ def page_dashboard(active_session_id: Optional[int]):
     } for (pk, ext_id, title, category, author) in needing]
     st.table(table_rows)
 
-    st.caption("Click 'Run now' on any row below to execute it directly.")
+    st.caption("Run any of these directly:")
 
     # Actionable list with inline run buttons/forms
     for (pk, ext_id, title, category, author) in needing:
         key_prefix = f"needpass_{pk}"
-        cols = st.columns([3,3,2,2,2])
-        cols[0].markdown(f"**[{ext_id or pk}]** {title}")
-        cols[1].markdown(f"_{category}_")
-        cols[2].markdown(f"By: {author}")
-        with cols[4]:
-            show_form = st.toggle("Run now", key=f"toggle_{key_prefix}")
-        if show_form:
+        with st.expander(f"Run [{ext_id or pk}] {title} (by {author})"):
             with st.form(f"run_{key_prefix}"):
                 url = st.text_input("URL under test", key=f"url_{key_prefix}")
                 phase = st.selectbox("Phase", options=["FT","SIT","UAT"], key=f"phase_{key_prefix}")
@@ -701,7 +659,7 @@ def page_dashboard(active_session_id: Optional[int]):
                             record_test_run(
                                 test_case_id=pk,
                                 session_id=active_session_id,
-                                runner_id=None,
+                                runner_id=current_user_id,
                                 url=url,
                                 phase=phase,
                                 status=status,
@@ -710,19 +668,6 @@ def page_dashboard(active_session_id: Optional[int]):
                             st.success("Run recorded.")
                         except Exception as e:
                             st.error(f"Failed to record run: {e}")
-    return
-    c = counts_for_session(active_session_id)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("All test runs", c["total_runs"])
-    col2.metric("Failed runs", c["failed_runs"])
-    col3.metric("To be executed (need a PASS)", c["to_execute"])
-
-    st.subheader("Failure severity in session (info)")
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Minor", c["minor"])
-    s2.metric("Major", c["major"])
-    s3.metric("Critical", c["critical"])
 
 
 # ---------------------------
@@ -774,7 +719,7 @@ def main():
     elif page == "Failures":
         page_failures(current_user_id, active_session_id)
     elif page == "Dashboard":
-        page_dashboard(active_session_id)
+        page_dashboard(active_session_id, current_user_id)
 
 
 if __name__ == "__main__":
