@@ -102,7 +102,7 @@ def init_db():
         """
     )
 
-    # failure classifications (still useful for reporting, but no longer blocks closing)
+    # failure classifications (for reporting)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS failures (
@@ -125,7 +125,23 @@ def init_db():
 # Helper functions
 # ---------------------------
 
-def upsert_user(name: str, role: str):
+def get_next_external_id() -> str:
+    """Generate next external test case ID like 'TC-1', 'TC-2', ..."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT MAX(CAST(SUBSTR(external_id, 4) AS INTEGER))
+        FROM test_cases
+        WHERE external_id LIKE 'TC-%'
+        """
+    )
+    row = cur.fetchone()
+    conn.close()
+    next_num = (row[0] or 0) + 1
+    return f"TC-{next_num}"
+
+def upsert_user(name: str, role: str):(name: str, role: str):
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -179,13 +195,12 @@ def list_sessions(include_closed=True):
 
 
 def close_session(session_id: int) -> bool:
-    """New rule: a session can be closed if **each test case has at least one PASSED run** in this session.
-    Failed runs (even major/critical) do not block closure if a pass exists for that test case.
+    """New rule: a session can be closed if each test case has at least one PASSED run in this session.
+    Failed runs do not block closure if a pass exists for that test case.
     """
     conn = get_conn()
     cur = conn.cursor()
 
-    # Count test cases that lack a passed run in this session
     cur.execute(
         """
         SELECT COUNT(*)
@@ -208,14 +223,22 @@ def close_session(session_id: int) -> bool:
     return True
 
 
-def add_test_case(external_id: str, title: str, steps: List[str], expected: str, category: str, author_id: Optional[int]):
+def add_test_case(title: str, steps: List[str], expected: str, category: str, author_id: Optional[int]):
     conn = get_conn()
     cur = conn.cursor()
     steps_json = json.dumps(steps)
-    # Pre-check uniqueness for friendlier error
-    cur.execute("SELECT 1 FROM test_cases WHERE external_id = ?", (external_id.strip(),))
-    if cur.fetchone():
-        conn.close()
+    external_id = get_next_external_id()
+
+    cur.execute(
+        """
+        INSERT INTO test_cases(external_id, title, steps_json, expected_result, category, author_id)
+        VALUES (?,?,?,?,?,?)
+        """,
+        (external_id, title.strip(), steps_json, expected.strip(), category, author_id),
+    )
+    conn.commit()
+    conn.close()
+    return external_id
         raise ValueError(f"Test case ID '{external_id}' already exists.")
 
     cur.execute(
@@ -233,7 +256,9 @@ def list_test_cases():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT tc.id, tc.external_id, tc.title, tc.category, tc.expected_result, tc.steps_json, u.name AS author\n         FROM test_cases tc LEFT JOIN users u ON u.id = tc.author_id\n         ORDER BY tc.id DESC"
+        "SELECT tc.id, tc.external_id, tc.title, tc.category, tc.expected_result, tc.steps_json, u.name AS author
+         FROM test_cases tc LEFT JOIN users u ON u.id = tc.author_id
+         ORDER BY tc.id DESC"
     )
     rows = cur.fetchall()
     conn.close()
@@ -326,6 +351,22 @@ def counts_for_session(session_id: int):
     )
     minor, major, critical = cur.fetchone()
 
+    # also return the list of test cases needing a PASS for convenience
+    cur.execute(
+        """
+        SELECT tc.id, tc.external_id, tc.title, tc.category, COALESCE(u.name,'—')
+        FROM test_cases tc
+        LEFT JOIN users u ON u.id = tc.author_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM test_runs r
+            WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status='passed'
+        )
+        ORDER BY tc.id ASC
+        """,
+        (session_id,),
+    )
+    needing_pass = cur.fetchall()
+
     conn.close()
     return {
         "total_runs": total_runs,
@@ -334,6 +375,7 @@ def counts_for_session(session_id: int):
         "minor": minor,
         "major": major,
         "critical": critical,
+        "needing_pass": needing_pass,
     }
 
 
@@ -369,6 +411,20 @@ def role_of(user_id: Optional[int]) -> Optional[str]:
 
 def page_overview():
     st.title("Test Management App — Overview")
+    st.markdown(
+        """
+        **What you can do here**
+
+        - **Users**: Add testers and test leads.
+        - **Test Cases** *(test leads)*: Create cases; each one gets an auto-generated **Test Case ID** like `TC-1`, `TC-2`, ... with up to five steps, expected result, and category (**integration** or **studio**).
+        - **Run Tests**: Select a case, provide a URL, choose phase (**FT / SIT / UAT**), set status (**passed / failed**), and add an optional comment.
+        - **Failures** *(test leads)*: Review failed runs and classify them as **minor / major / critical** (reporting only).
+        - **Dashboard**: See totals and a live list of test cases that **still need a PASS** this session, and run them directly from there.
+        - **Sessions**: Create a test session and close it once **every test case has at least one PASSED run** in that session.
+
+        Use the sidebar to select your **user** and the **active session**.
+        """
+    )
     st.markdown(
         """
         **What you can do here**
@@ -457,7 +513,7 @@ def page_test_cases(current_user_id: Optional[int]):
 
     with st.expander("Add a Test Case", expanded=(r=="testlead")):
         with st.form("add_tc"):
-            external_id = st.text_input("Test Case ID (e.g. TC-1)")
+            st.caption("The ID will be assigned automatically (e.g. TC-1, TC-2).")
             title = st.text_input("Title")
             category = st.selectbox("Category", options=["integration","studio"])
             num_steps = st.number_input("Number of steps (1-5)", min_value=1, max_value=5, value=1, step=1)
@@ -467,9 +523,7 @@ def page_test_cases(current_user_id: Optional[int]):
             expected = st.text_area("Expected Result")
             submitted = st.form_submit_button("Create Test Case")
             if submitted:
-                if not external_id.strip():
-                    st.error("Test Case ID is required.")
-                elif not title.strip():
+                if not title.strip():
                     st.error("Title is required.")
                 elif any(not s.strip() for s in steps):
                     st.error("All steps must be filled.")
@@ -477,8 +531,8 @@ def page_test_cases(current_user_id: Optional[int]):
                     st.error("Expected result is required.")
                 else:
                     try:
-                        add_test_case(external_id, title, steps, expected, category, current_user_id)
-                        st.success("Test case created.")
+                        new_id = add_test_case(title, steps, expected, category, current_user_id)
+                        st.success(f"Test case created with ID: {new_id}")
                     except Exception as e:
                         st.error(f"Failed to create test case: {e}")
 
@@ -591,6 +645,70 @@ def page_dashboard(active_session_id: Optional[int]):
     if active_session_id is None:
         st.error("Select or create an active session in the sidebar first.")
         return
+    c = counts_for_session(active_session_id)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("All test runs", c["total_runs"])
+    col2.metric("Failed runs", c["failed_runs"])
+    col3.metric("Need a PASS", c["to_execute"])
+
+    st.subheader("Failure severity in session (info)")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Minor", c["minor"])
+    s2.metric("Major", c["major"])
+    s3.metric("Critical", c["critical"])
+
+    st.subheader("Test cases without a PASS yet (this session)")
+    needing = c["needing_pass"]
+    if not needing:
+        st.success("All test cases have at least one PASSED run in this session. 🎉")
+        return
+
+    # Present in a table format
+    table_rows = [{
+        "TC ID": (ext_id or pk),
+        "Title": title,
+        "Category": category,
+        "Author": author,
+    } for (pk, ext_id, title, category, author) in needing]
+    st.table(table_rows)
+
+    st.caption("Click 'Run now' on any row below to execute it directly.")
+
+    # Actionable list with inline run buttons/forms
+    for (pk, ext_id, title, category, author) in needing:
+        key_prefix = f"needpass_{pk}"
+        cols = st.columns([3,3,2,2,2])
+        cols[0].markdown(f"**[{ext_id or pk}]** {title}")
+        cols[1].markdown(f"_{category}_")
+        cols[2].markdown(f"By: {author}")
+        with cols[4]:
+            show_form = st.toggle("Run now", key=f"toggle_{key_prefix}")
+        if show_form:
+            with st.form(f"run_{key_prefix}"):
+                url = st.text_input("URL under test", key=f"url_{key_prefix}")
+                phase = st.selectbox("Phase", options=["FT","SIT","UAT"], key=f"phase_{key_prefix}")
+                status = st.selectbox("Status", options=["passed","failed"], index=0, key=f"status_{key_prefix}")
+                comment = st.text_area("Comment (optional)", key=f"comment_{key_prefix}")
+                submitted = st.form_submit_button("Record Run")
+                if submitted:
+                    if not url.strip():
+                        st.error("URL is required.")
+                    else:
+                        try:
+                            record_test_run(
+                                test_case_id=pk,
+                                session_id=active_session_id,
+                                runner_id=None,
+                                url=url,
+                                phase=phase,
+                                status=status,
+                                comment=comment or "",
+                            )
+                            st.success("Run recorded.")
+                        except Exception as e:
+                            st.error(f"Failed to record run: {e}")
+    return
     c = counts_for_session(active_session_id)
 
     col1, col2, col3 = st.columns(3)
