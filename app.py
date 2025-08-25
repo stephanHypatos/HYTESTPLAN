@@ -256,9 +256,11 @@ def list_test_cases():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT tc.id, tc.external_id, tc.title, tc.category, tc.expected_result, tc.steps_json, u.name AS author
-         FROM test_cases tc LEFT JOIN users u ON u.id = tc.author_id
-         ORDER BY tc.id DESC"
+        """
+        SELECT tc.id, tc.external_id, tc.title, tc.category, tc.expected_result, tc.steps_json, u.name AS author
+        FROM test_cases tc LEFT JOIN users u ON u.id = tc.author_id
+        ORDER BY tc.id DESC
+        """
     )
     rows = cur.fetchall()
     conn.close()
