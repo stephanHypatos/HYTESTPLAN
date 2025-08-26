@@ -25,7 +25,7 @@ from typing import List, Optional
 
 DB_PATH = "test_mgmt.db"
 DB_URL = os.getenv("DATABASE_URL", "").strip()
-DB_BACKEND = "postgres" if DB_URL.lower().startswith("postgres") else "sqlite"
+DB_BACKEND = "postgres" if DB_URL.lower().startswith(("postgres://", "postgresql://")) else "sqlite"
 
 # ---------------------------
 # Database utilities
@@ -67,7 +67,6 @@ def _conn_postgres():
     try:
         return psycopg2.connect(**kwargs)
     except psycopg2.OperationalError:
-        # Resolve IPv4 A record and retry with hostaddr to avoid IPv6 issues on some hosts
         try:
             infos = socket.getaddrinfo(kwargs["host"], kwargs["port"], socket.AF_INET, socket.SOCK_STREAM)
             if infos:
@@ -76,8 +75,8 @@ def _conn_postgres():
                 return psycopg2.connect(**kwargs_ipv4)
         except Exception:
             pass
-        # re-raise original
         raise
+
 
 def get_conn():
     return _conn_postgres() if DB_BACKEND == "postgres" else _conn_sqlite()
@@ -87,16 +86,12 @@ def q(sql: str) -> str:
     """Adapt placeholder style between sqlite (?) and postgres (%s)."""
     if DB_BACKEND == "postgres":
         return sql.replace("?", "%s")
-    return sql():
-    return _conn_postgres() if DB_BACKEND == "postgres" else _conn_sqlite()
-
-
-def q(sql: str) -> str:
-    """Adapt placeholder style between sqlite (?) and postgres (%s)."""
-    if DB_BACKEND == "postgres":
-        return sql.replace("?", "%s")
     return sql
 
+
+# ---------------------------
+# Schema / Init
+# ---------------------------
 
 def init_db():
     conn = get_conn()
@@ -456,12 +451,23 @@ def list_test_runs(session_id: Optional[int] = None, only_failed: bool = False):
 def classify_failure(run_id: int, severity: str, user_id: Optional[int]):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        q("INSERT OR REPLACE INTO failures(run_id, severity, noted_by, noted_at) VALUES (?,?,?,?)")
-        if DB_BACKEND == "sqlite"
-        else "INSERT INTO failures(run_id, severity, noted_by, noted_at) VALUES (%s,%s,%s,%s)\n             ON CONFLICT(run_id) DO UPDATE SET severity=EXCLUDED.severity, noted_by=EXCLUDED.noted_by, noted_at=EXCLUDED.noted_at",
-        (run_id, severity, user_id, datetime.utcnow().isoformat()),
-    )
+    if DB_BACKEND == "sqlite":
+        cur.execute(
+            q("INSERT OR REPLACE INTO failures(run_id, severity, noted_by, noted_at) VALUES (?,?,?,?)"),
+            (run_id, severity, user_id, datetime.utcnow().isoformat()),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO failures(run_id, severity, noted_by, noted_at)
+            VALUES (%s,%s,%s,%s)
+            ON CONFLICT(run_id) DO UPDATE SET
+                severity=EXCLUDED.severity,
+                noted_by=EXCLUDED.noted_by,
+                noted_at=EXCLUDED.noted_at
+            """,
+            (run_id, severity, user_id, datetime.utcnow().isoformat()),
+        )
     conn.commit()
     conn.close()
 
@@ -544,6 +550,35 @@ def require_current_user():
     if selected == "<anonymous>":
         return None
     return name_to_id[selected]
+
+
+def _redact_db_url(url: str) -> str:
+    if not url:
+        return ""
+    u = urlparse(url)
+    user = u.username or ""
+    pwd = "*****" if u.password else None
+    netloc = u.hostname or ""
+    if u.port:
+        netloc += f":{u.port}"
+    auth = user + (f":{pwd}" if pwd else "")
+    if auth:
+        netloc = f"{auth}@{netloc}"
+    qs = ("?" + u.query) if u.query else ""
+    return f"{u.scheme}://{netloc}{u.path}{qs}"
+
+
+def _resolve_host(host: str, port: int):
+    addrs_v4, addrs_v6 = set(), set()
+    try:
+        for fam in (socket.AF_INET, socket.AF_INET6):
+            infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
+            for info in infos:
+                ip = info[4][0]
+                (addrs_v4 if fam == socket.AF_INET else addrs_v6).add(ip)
+    except Exception:
+        pass
+    return sorted(addrs_v4), sorted(addrs_v6)
 
 
 # ---------------------------
@@ -633,8 +668,9 @@ def page_sessions(current_user_id: Optional[int]):
 
 
 def page_test_cases(current_user_id: Optional[int]):
-    r = role_of(current_user_id)
     st.title("Test Cases")
+    from inspect import cleandoc
+    r = role_of(current_user_id)
     if r != "testlead":
         st.warning("Only test leads can add test cases. You can still browse existing cases below.")
 
@@ -828,6 +864,70 @@ def page_dashboard(active_session_id: Optional[int], current_user_id: Optional[i
                             st.error(f"Failed to record run: {e}")
 
 
+def page_diagnostics():
+    st.title("DB Diagnostics")
+    st.write("Quick checks to troubleshoot database connectivity and config.")
+
+    st.subheader("Environment")
+    st.write({
+        "DB_BACKEND": DB_BACKEND,
+        "DATABASE_URL set": bool(DB_URL),
+        "DATABASE_URL (redacted)": _redact_db_url(DB_URL),
+    })
+
+    if DB_BACKEND == "postgres" and DB_URL:
+        u = urlparse(DB_URL)
+        host = u.hostname or ""
+        port = u.port or 5432
+        sslmode = parse_qs(u.query or "").get("sslmode", ["require"])[0]
+        st.subheader("Parsed Postgres URL")
+        st.write({
+            "host": host,
+            "port": port,
+            "dbname": u.path[1:] or "postgres",
+            "user": u.username,
+            "sslmode": sslmode,
+        })
+
+        st.subheader("DNS Resolution")
+        v4, v6 = _resolve_host(host, port)
+        st.write({"IPv4": v4, "IPv6": v6})
+
+        st.subheader("Connection test")
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT version()")
+            version = cur.fetchone()[0]
+            cur.execute("SELECT current_database(), current_user")
+            dbname, dbuser = cur.fetchone()
+            cur.execute("SELECT NOW()")
+            now = cur.fetchone()[0]
+            st.success("Connected to Postgres successfully.")
+            st.write({"version": version, "current_database": dbname, "current_user": dbuser, "now": str(now)})
+            conn.close()
+        except Exception as e:
+            st.error("Postgres connection failed.")
+            st.exception(e)
+
+    if DB_BACKEND == "sqlite":
+        st.subheader("SQLite Info")
+        exists = os.path.exists(DB_PATH)
+        size = os.path.getsize(DB_PATH) if exists else 0
+        st.write({"db_path": DB_PATH, "exists": exists, "size_bytes": size})
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("select sqlite_version()")
+            ver = cur.fetchone()[0]
+            st.success("Connected to SQLite.")
+            st.write({"sqlite_version": ver})
+            conn.close()
+        except Exception as e:
+            st.error("SQLite connection failed.")
+            st.exception(e)
+
+
 # ---------------------------
 # App bootstrap
 # ---------------------------
@@ -848,6 +948,7 @@ def main():
             "Run Tests",
             "Failures",
             "Dashboard",
+            "Diagnostics",
         ],
     )
 
@@ -879,6 +980,8 @@ def main():
         page_failures(current_user_id, active_session_id)
     elif page == "Dashboard":
         page_dashboard(active_session_id, current_user_id)
+    elif page == "Diagnostics":
+        page_diagnostics()
 
 
 if __name__ == "__main__":
