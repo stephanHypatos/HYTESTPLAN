@@ -1,12 +1,20 @@
 # Requirements: Streamlit is not installed by default.
 # You need to install it before running this script.
 #
-# In your terminal or command prompt, run:
-#     pip install streamlit
-#
-# Then you can start the app with:
+# Local run:
+#     pip install streamlit psycopg2-binary
 #     streamlit run app.py
+#
+# On Streamlit Cloud:
+# - Add a `requirements.txt` with:  
+#       streamlit
+#       psycopg2-binary
+# - Set a secret/env var `DATABASE_URL` to your Supabase Postgres connection string, e.g.:  
+#       postgresql://postgres:<PASSWORD>@db.<PROJECT>.supabase.co:5432/postgres?sslmode=require
+#
+# If DATABASE_URL is not set, the app falls back to a local SQLite file `test_mgmt.db`.
 
+import os
 import streamlit as st
 import sqlite3
 import json
@@ -14,108 +22,189 @@ from datetime import datetime
 from typing import List, Optional
 
 DB_PATH = "test_mgmt.db"
+DB_URL = os.getenv("DATABASE_URL", "").strip()
+DB_BACKEND = "postgres" if DB_URL.lower().startswith("postgres") else "sqlite"
 
 # ---------------------------
 # Database utilities
 # ---------------------------
 
-def get_conn():
+def _conn_sqlite():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
+
+def _conn_postgres():
+    try:
+        import psycopg2  # installed via psycopg2-binary
+    except Exception as e:
+        raise RuntimeError("psycopg2-binary is required for Postgres/Supabase. Add it to requirements.txt") from e
+    return psycopg2.connect(DB_URL)
+
+
+def get_conn():
+    return _conn_postgres() if DB_BACKEND == "postgres" else _conn_sqlite()
+
+
+def q(sql: str) -> str:
+    """Adapt placeholder style between sqlite (?) and postgres (%s)."""
+    if DB_BACKEND == "postgres":
+        return sql.replace("?", "%s")
+    return sql
 
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # users
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('tester','testlead'))
-        );
-        """
-    )
+    if DB_BACKEND == "sqlite":
+        # users
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('tester','testlead'))
+            );
+            """
+        )
+        # sessions
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                created_at TEXT NOT NULL,
+                closed INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        # test_cases
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT,
+                title TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                expected_result TEXT NOT NULL,
+                category TEXT NOT NULL CHECK(category IN ('integration','studio')),
+                author_id INTEGER,
+                FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            """
+        )
+        # ensure external_id column exists (upgrade path) and unique index
+        cur.execute("PRAGMA table_info(test_cases)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "external_id" not in cols:
+            cur.execute("ALTER TABLE test_cases ADD COLUMN external_id TEXT")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_test_cases_external_id
+            ON test_cases(external_id)
+            WHERE external_id IS NOT NULL
+            """
+        )
+        # runs
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_case_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                runner_id INTEGER,
+                url TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('FT','SIT','UAT')),
+                status TEXT NOT NULL CHECK(status IN ('passed','failed')),
+                comment TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(test_case_id) REFERENCES test_cases(id) ON DELETE CASCADE,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY(runner_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            """
+        )
+        # failures
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER UNIQUE NOT NULL,
+                severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
+                noted_by INTEGER,
+                noted_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES test_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY(noted_by) REFERENCES users(id) ON DELETE SET NULL
+            );
+            """
+        )
 
-    # sessions
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            created_at TEXT NOT NULL,
-            closed INTEGER NOT NULL DEFAULT 0
-        );
-        """
-    )
-
-    # test_cases (with external_id)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS test_cases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            external_id TEXT,                 -- e.g., "TC-1" (unique via index below)
-            title TEXT NOT NULL,
-            steps_json TEXT NOT NULL,        -- JSON list of 1..5 strings
-            expected_result TEXT NOT NULL,
-            category TEXT NOT NULL CHECK(category IN ('integration','studio')),
-            author_id INTEGER,
-            FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE SET NULL
-        );
-        """
-    )
-
-    # ensure external_id column exists (for upgrades) and unique index
-    cur.execute("PRAGMA table_info(test_cases)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "external_id" not in cols:
-        cur.execute("ALTER TABLE test_cases ADD COLUMN external_id TEXT")
-    # create unique index if not present
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_test_cases_external_id
-        ON test_cases(external_id)
-        WHERE external_id IS NOT NULL
-        """
-    )
-
-    # runs
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS test_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            test_case_id INTEGER NOT NULL,
-            session_id INTEGER NOT NULL,
-            runner_id INTEGER,
-            url TEXT NOT NULL,
-            phase TEXT NOT NULL CHECK(phase IN ('FT','SIT','UAT')),
-            status TEXT NOT NULL CHECK(status IN ('passed','failed')),
-            comment TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(test_case_id) REFERENCES test_cases(id) ON DELETE CASCADE,
-            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-            FOREIGN KEY(runner_id) REFERENCES users(id) ON DELETE SET NULL
-        );
-        """
-    )
-
-    # failure classifications (for reporting)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS failures (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER UNIQUE NOT NULL,
-            severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
-            noted_by INTEGER,
-            noted_at TEXT NOT NULL,
-            FOREIGN KEY(run_id) REFERENCES test_runs(id) ON DELETE CASCADE,
-            FOREIGN KEY(noted_by) REFERENCES users(id) ON DELETE SET NULL
-        );
-        """
-    )
+    else:  # postgres (Supabase)
+        # users
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('tester','testlead'))
+            );
+            """
+        )
+        # sessions
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                created_at TEXT NOT NULL,
+                closed INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        # test_cases
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_cases (
+                id SERIAL PRIMARY KEY,
+                external_id TEXT UNIQUE,
+                title TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                expected_result TEXT NOT NULL,
+                category TEXT NOT NULL CHECK(category IN ('integration','studio')),
+                author_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+            );
+            """
+        )
+        # runs
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_runs (
+                id SERIAL PRIMARY KEY,
+                test_case_id INTEGER NOT NULL REFERENCES test_cases(id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                runner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                url TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('FT','SIT','UAT')),
+                status TEXT NOT NULL CHECK(status IN ('passed','failed')),
+                comment TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        # failures
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS failures (
+                id SERIAL PRIMARY KEY,
+                run_id INTEGER UNIQUE NOT NULL REFERENCES test_runs(id) ON DELETE CASCADE,
+                severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
+                noted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                noted_at TEXT NOT NULL
+            );
+            """
+        )
 
     conn.commit()
     conn.close()
@@ -129,13 +218,22 @@ def get_next_external_id() -> str:
     """Generate next external test case ID like 'TC-1', 'TC-2', ..."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT MAX(CAST(SUBSTR(external_id, 4) AS INTEGER))
-        FROM test_cases
-        WHERE external_id LIKE 'TC-%'
-        """
-    )
+    if DB_BACKEND == "postgres":
+        cur.execute(
+            """
+            SELECT MAX(CAST(SUBSTRING(external_id FROM 4) AS INTEGER))
+            FROM test_cases
+            WHERE external_id LIKE 'TC-%'
+            """
+        )
+    else:
+        cur.execute(
+            """
+            SELECT MAX(CAST(SUBSTR(external_id, 4) AS INTEGER))
+            FROM test_cases
+            WHERE external_id LIKE 'TC-%'
+            """
+        )
     row = cur.fetchone()
     conn.close()
     next_num = (row[0] or 0) + 1
@@ -146,9 +244,18 @@ def upsert_user(name: str, role: str):
     conn = get_conn()
     cur = conn.cursor()
     try:
-        cur.execute("INSERT OR IGNORE INTO users(name, role) VALUES (?,?)", (name.strip(), role))
-        if cur.rowcount == 0:
-            cur.execute("UPDATE users SET role=? WHERE name=?", (role, name.strip()))
+        if DB_BACKEND == "postgres":
+            cur.execute(
+                """
+                INSERT INTO users(name, role) VALUES (%s, %s)
+                ON CONFLICT(name) DO UPDATE SET role = EXCLUDED.role
+                """,
+                (name.strip(), role),
+            )
+        else:  # sqlite
+            cur.execute("INSERT OR IGNORE INTO users(name, role) VALUES (?,?)", (name.strip(), role))
+            if cur.rowcount == 0:
+                cur.execute("UPDATE users SET role=? WHERE name=?", (role, name.strip()))
         conn.commit()
     finally:
         conn.close()
@@ -168,7 +275,7 @@ def role_of(user_id: Optional[int]) -> Optional[str]:
         return None
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT role FROM users WHERE id=?", (user_id,))
+    cur.execute(q("SELECT role FROM users WHERE id=?"), (user_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
@@ -178,7 +285,7 @@ def create_session(name: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO sessions(name, created_at, closed) VALUES (?,?,0)",
+        q("INSERT INTO sessions(name, created_at, closed) VALUES (?,?,0)"),
         (name.strip(), datetime.utcnow().isoformat()),
     )
     conn.commit()
@@ -198,20 +305,21 @@ def list_sessions(include_closed=True):
 
 
 def close_session(session_id: int) -> bool:
-    """Rule: a session can be closed if each test case has at least one PASSED run in this session.
-    Failed runs do not block closure if a pass exists for that test case.
-    """
+    """A session can be closed if each test case has at least one PASSED run in this session."""
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM test_cases tc
-        WHERE NOT EXISTS (
-            SELECT 1 FROM test_runs r
-            WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status = 'passed'
-        )
-        """,
+        q(
+            """
+            SELECT COUNT(*)
+            FROM test_cases tc
+            WHERE NOT EXISTS (
+                SELECT 1 FROM test_runs r
+                WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status = 'passed'
+            )
+            """
+        ),
         (session_id,),
     )
     missing_pass = cur.fetchone()[0]
@@ -219,7 +327,7 @@ def close_session(session_id: int) -> bool:
         conn.close()
         return False
 
-    cur.execute("UPDATE sessions SET closed=1 WHERE id=?", (session_id,))
+    cur.execute(q("UPDATE sessions SET closed=1 WHERE id=?"), (session_id,))
     conn.commit()
     conn.close()
     return True
@@ -231,10 +339,12 @@ def add_test_case(title: str, steps: List[str], expected: str, category: str, au
     steps_json = json.dumps(steps)
     external_id = get_next_external_id()
     cur.execute(
-        """
-        INSERT INTO test_cases(external_id, title, steps_json, expected_result, category, author_id)
-        VALUES (?,?,?,?,?,?)
-        """,
+        q(
+            """
+            INSERT INTO test_cases(external_id, title, steps_json, expected_result, category, author_id)
+            VALUES (?,?,?,?,?,?)
+            """
+        ),
         (external_id, title.strip(), steps_json, expected.strip(), category, author_id),
     )
     conn.commit()
@@ -261,10 +371,12 @@ def record_test_run(test_case_id: int, session_id: int, runner_id: Optional[int]
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """
-        INSERT INTO test_runs(test_case_id, session_id, runner_id, url, phase, status, comment, created_at)
-        VALUES (?,?,?,?,?,?,?,?)
-        """,
+        q(
+            """
+            INSERT INTO test_runs(test_case_id, session_id, runner_id, url, phase, status, comment, created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """
+        ),
         (test_case_id, session_id, runner_id, url.strip(), phase, status, comment.strip(), datetime.utcnow().isoformat()),
     )
     conn.commit()
@@ -274,7 +386,7 @@ def record_test_run(test_case_id: int, session_id: int, runner_id: Optional[int]
 def list_test_runs(session_id: Optional[int] = None, only_failed: bool = False):
     conn = get_conn()
     cur = conn.cursor()
-    q = [
+    qparts = [
         "SELECT r.id, r.test_case_id, r.session_id, r.url, r.phase, r.status, r.comment, r.created_at,",
         "tc.title, tc.category, u.name as runner, f.severity, tc.external_id",
         "FROM test_runs r",
@@ -285,12 +397,13 @@ def list_test_runs(session_id: Optional[int] = None, only_failed: bool = False):
     ]
     params = []
     if session_id is not None:
-        q.append("AND r.session_id = ?")
+        qparts.append("AND r.session_id = ?")
         params.append(session_id)
     if only_failed:
-        q.append("AND r.status = 'failed'")
-    q.append("ORDER BY r.created_at DESC")
-    cur.execute("\n".join(q), tuple(params))
+        qparts.append("AND r.status = 'failed'")
+    qparts.append("ORDER BY r.created_at DESC")
+    sql = "\n".join(qparts)
+    cur.execute(q(sql), tuple(params))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -300,7 +413,9 @@ def classify_failure(run_id: int, severity: str, user_id: Optional[int]):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO failures(run_id, severity, noted_by, noted_at) VALUES (?,?,?,?)",
+        q("INSERT OR REPLACE INTO failures(run_id, severity, noted_by, noted_at) VALUES (?,?,?,?)")
+        if DB_BACKEND == "sqlite"
+        else "INSERT INTO failures(run_id, severity, noted_by, noted_at) VALUES (%s,%s,%s,%s)\n             ON CONFLICT(run_id) DO UPDATE SET severity=EXCLUDED.severity, noted_by=EXCLUDED.noted_by, noted_at=EXCLUDED.noted_at",
         (run_id, severity, user_id, datetime.utcnow().isoformat()),
     )
     conn.commit()
@@ -310,51 +425,52 @@ def classify_failure(run_id: int, severity: str, user_id: Optional[int]):
 def counts_for_session(session_id: int):
     conn = get_conn()
     cur = conn.cursor()
-    # total tests = number of runs in session
-    cur.execute("SELECT COUNT(*) FROM test_runs WHERE session_id=?", (session_id,))
+    cur.execute(q("SELECT COUNT(*) FROM test_runs WHERE session_id=?"), (session_id,))
     total_runs = cur.fetchone()[0]
 
-    # failed tests in session
-    cur.execute("SELECT COUNT(*) FROM test_runs WHERE session_id=? AND status='failed'", (session_id,))
+    cur.execute(q("SELECT COUNT(*) FROM test_runs WHERE session_id=? AND status='failed'"), (session_id,))
     failed_runs = cur.fetchone()[0]
 
-    # to be executed = test_cases without a *passed* run in this session (per rule)
     cur.execute(
-        """
-        SELECT COUNT(*) FROM test_cases tc
-        WHERE NOT EXISTS (
-            SELECT 1 FROM test_runs r
-            WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status='passed'
-        )
-        """,
+        q(
+            """
+            SELECT COUNT(*) FROM test_cases tc
+            WHERE NOT EXISTS (
+                SELECT 1 FROM test_runs r
+                WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status='passed'
+            )
+            """
+        ),
         (session_id,),
     )
     to_execute = cur.fetchone()[0]
 
-    # failure severity counts (for info only)
     cur.execute(
-        """
-        SELECT COALESCE(SUM(CASE WHEN f.severity='minor' THEN 1 ELSE 0 END),0),
-               COALESCE(SUM(CASE WHEN f.severity='major' THEN 1 ELSE 0 END),0),
-               COALESCE(SUM(CASE WHEN f.severity='critical' THEN 1 ELSE 0 END),0)
-        FROM failures f JOIN test_runs r ON r.id=f.run_id WHERE r.session_id=?
-        """,
+        q(
+            """
+            SELECT COALESCE(SUM(CASE WHEN f.severity='minor' THEN 1 ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN f.severity='major' THEN 1 ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN f.severity='critical' THEN 1 ELSE 0 END),0)
+            FROM failures f JOIN test_runs r ON r.id=f.run_id WHERE r.session_id=?
+            """
+        ),
         (session_id,),
     )
     minor, major, critical = cur.fetchone()
 
-    # also return the list of test cases needing a PASS for convenience
     cur.execute(
-        """
-        SELECT tc.id, tc.external_id, tc.title, tc.category, COALESCE(u.name,'—')
-        FROM test_cases tc
-        LEFT JOIN users u ON u.id = tc.author_id
-        WHERE NOT EXISTS (
-            SELECT 1 FROM test_runs r
-            WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status='passed'
-        )
-        ORDER BY tc.id ASC
-        """,
+        q(
+            """
+            SELECT tc.id, tc.external_id, tc.title, tc.category, COALESCE(u.name,'—')
+            FROM test_cases tc
+            LEFT JOIN users u ON u.id = tc.author_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM test_runs r
+                WHERE r.test_case_id = tc.id AND r.session_id = ? AND r.status='passed'
+            )
+            ORDER BY tc.id ASC
+            """
+        ),
         (session_id,),
     )
     needing_pass = cur.fetchall()
@@ -630,7 +746,6 @@ def page_dashboard(active_session_id: Optional[int], current_user_id: Optional[i
         st.success("All test cases have at least one PASSED run in this session. 🎉")
         return
 
-    # Present in a table format
     table_rows = [{
         "TC ID": (ext_id or pk),
         "Title": title,
@@ -641,7 +756,6 @@ def page_dashboard(active_session_id: Optional[int], current_user_id: Optional[i
 
     st.caption("Run any of these directly:")
 
-    # Actionable list with inline run buttons/forms
     for (pk, ext_id, title, category, author) in needing:
         key_prefix = f"needpass_{pk}"
         with st.expander(f"Run [{ext_id or pk}] {title} (by {author})"):
@@ -679,6 +793,7 @@ def main():
     init_db()
 
     st.sidebar.title("Navigation")
+    st.sidebar.caption(f"DB backend: {DB_BACKEND}")
     page = st.sidebar.radio(
         "Go to",
         [
