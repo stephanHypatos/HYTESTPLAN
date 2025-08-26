@@ -915,6 +915,9 @@ def page_dashboard(active_session_id: Optional[int], current_user_id: Optional[i
 
 
 def page_diagnostics():
+    """Self-checks for DB connectivity and config.
+    Safe to run regardless of backend; prints helpful info rather than crashing the app.
+    """
     st.title("DB Diagnostics")
     st.write("Quick checks to troubleshoot database connectivity and config.")
 
@@ -945,10 +948,10 @@ def page_diagnostics():
         st.write({"IPv4": v4, "IPv6": v6})
 
         st.subheader("Connection test")
-        # Try explicit IPv4 (if available), then normal
         tried = []
         conn = None
         try:
+            # Prefer explicit IPv4 path first if available
             if v4:
                 tried.append("ipv4")
                 import psycopg2
@@ -967,15 +970,25 @@ def page_diagnostics():
             else:
                 tried.append("normal")
                 conn = get_conn()
+
             cur = conn.cursor()
             cur.execute("SELECT version()")
             version = cur.fetchone()[0]
-            cur.execute("SELECT current_database(), current_user")
-            dbname, dbuser = cur.fetchone()
-            cur.execute("SELECT NOW()")
-            now = cur.fetchone()[0]
+            # Some managed poolers don't allow these, so protect with try
+            dbname = user = now = "?"
+            try:
+                cur.execute("SELECT current_database(), current_user")
+                dbname, user = cur.fetchone()
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT NOW()")
+                now = cur.fetchone()[0]
+            except Exception:
+                pass
+
             st.success(f"Connected to Postgres successfully via: {tried[-1]}")
-            st.write({"version": version, "current_database": dbname, "current_user": dbuser, "now": str(now)})
+            st.write({"version": version, "current_database": str(dbname), "current_user": str(user), "now": str(now)})
         except Exception as e:
             st.error(f"Postgres connection failed. Tried paths: {tried or ['normal']}")
             st.exception(e)
@@ -985,9 +998,6 @@ def page_diagnostics():
                     conn.close()
             except Exception:
                 pass
-        except Exception as e:
-            st.error("Postgres connection failed.")
-            st.exception(e)
 
     if DB_BACKEND == "sqlite":
         st.subheader("SQLite Info")
@@ -1001,10 +1011,15 @@ def page_diagnostics():
             ver = cur.fetchone()[0]
             st.success("Connected to SQLite.")
             st.write({"sqlite_version": ver})
-            conn.close()
         except Exception as e:
             st.error("SQLite connection failed.")
             st.exception(e)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 
 # ---------------------------
