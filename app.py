@@ -18,6 +18,8 @@ import os
 import streamlit as st
 import sqlite3
 import json
+import socket
+from urllib.parse import urlparse, parse_qs, unquote
 from datetime import datetime
 from typing import List, Optional
 
@@ -40,10 +42,52 @@ def _conn_postgres():
         import psycopg2  # installed via psycopg2-binary
     except Exception as e:
         raise RuntimeError("psycopg2-binary is required for Postgres/Supabase. Add it to requirements.txt") from e
-    return psycopg2.connect(DB_URL)
 
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL is not set. Add it in your environment or Streamlit secrets.")
+
+    # Parse DATABASE_URL and build keyword args
+    u = urlparse(DB_URL)
+    if u.scheme not in ("postgres", "postgresql"):
+        raise RuntimeError(f"Unsupported DATABASE_URL scheme: {u.scheme}")
+
+    kwargs = {
+        "dbname": (u.path[1:] or "postgres"),
+        "user": unquote(u.username) if u.username else None,
+        "password": unquote(u.password) if u.password else None,
+        "host": u.hostname,
+        "port": u.port or 5432,
+        "connect_timeout": 10,
+    }
+    # sslmode (default require)
+    qs = parse_qs(u.query or "")
+    kwargs["sslmode"] = (qs.get("sslmode", ["require"])[0])
+
+    # First try normal connect (may choose IPv6). If it fails, retry forcing IPv4 via hostaddr.
+    try:
+        return psycopg2.connect(**kwargs)
+    except psycopg2.OperationalError:
+        # Resolve IPv4 A record and retry with hostaddr to avoid IPv6 issues on some hosts
+        try:
+            infos = socket.getaddrinfo(kwargs["host"], kwargs["port"], socket.AF_INET, socket.SOCK_STREAM)
+            if infos:
+                ipv4 = infos[0][4][0]
+                kwargs_ipv4 = {**kwargs, "hostaddr": ipv4}
+                return psycopg2.connect(**kwargs_ipv4)
+        except Exception:
+            pass
+        # re-raise original
+        raise
 
 def get_conn():
+    return _conn_postgres() if DB_BACKEND == "postgres" else _conn_sqlite()
+
+
+def q(sql: str) -> str:
+    """Adapt placeholder style between sqlite (?) and postgres (%s)."""
+    if DB_BACKEND == "postgres":
+        return sql.replace("?", "%s")
+    return sql():
     return _conn_postgres() if DB_BACKEND == "postgres" else _conn_sqlite()
 
 
