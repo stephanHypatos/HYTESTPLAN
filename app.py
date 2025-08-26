@@ -26,6 +26,7 @@ from typing import List, Optional
 DB_PATH = "test_mgmt.db"
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 DB_BACKEND = "postgres" if DB_URL.lower().startswith(("postgres://", "postgresql://")) else "sqlite"
+DB_FORCE_IPV4 = os.getenv("DB_FORCE_IPV4", "1").lower() in ("1", "true", "yes")
 
 # ---------------------------
 # Database utilities
@@ -41,6 +42,55 @@ def _conn_postgres():
     try:
         import psycopg2  # installed via psycopg2-binary
     except Exception as e:
+        raise RuntimeError("psycopg2-binary is required for Postgres/Supabase. Add it to requirements.txt") from e
+
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL is not set. Add it in your environment or Streamlit secrets.")
+
+    # Parse DATABASE_URL and build keyword args
+    u = urlparse(DB_URL)
+    if u.scheme not in ("postgres", "postgresql"):
+        raise RuntimeError(f"Unsupported DATABASE_URL scheme: {u.scheme}")
+
+    kwargs = {
+        "dbname": (u.path[1:] or "postgres"),
+        "user": unquote(u.username) if u.username else None,
+        "password": unquote(u.password) if u.password else None,
+        "host": u.hostname,
+        "port": u.port or 5432,
+        "connect_timeout": 10,
+    }
+    # sslmode (default require)
+    qs = parse_qs(u.query or "")
+    kwargs["sslmode"] = (qs.get("sslmode", ["require"])[0])
+
+    # Prefer IPv4 if available (to avoid IPv6 EADDRNOTAVAIL on some hosts)
+    try_ipv4_first = False
+    try:
+        infos_v4 = socket.getaddrinfo(kwargs["host"], kwargs["port"], socket.AF_INET, socket.SOCK_STREAM)
+        if infos_v4:
+            ipv4 = infos_v4[0][4][0]
+            if DB_FORCE_IPV4:
+                kwargs_ipv4 = {**kwargs, "hostaddr": ipv4}
+                try_ipv4_first = True
+                return psycopg2.connect(**kwargs_ipv4)
+    except Exception:
+        pass
+
+    # Fallback: normal connect (may choose IPv6)
+    try:
+        return psycopg2.connect(**kwargs)
+    except psycopg2.OperationalError as e:
+        # If we didn't already try IPv4 first, try it now
+        if not try_ipv4_first:
+            try:
+                infos = socket.getaddrinfo(kwargs["host"], kwargs["port"], socket.AF_INET, socket.SOCK_STREAM)
+                if infos:
+                    ipv4 = infos[0][4][0]
+                    kwargs_ipv4 = {**kwargs, "hostaddr": ipv4}
+                    return psycopg2.connect(**kwargs_ipv4)
+            except Exception:
+                pass
         raise RuntimeError("psycopg2-binary is required for Postgres/Supabase. Add it to requirements.txt") from e
 
     if not DB_URL:
@@ -871,6 +921,7 @@ def page_diagnostics():
     st.subheader("Environment")
     st.write({
         "DB_BACKEND": DB_BACKEND,
+        "DB_FORCE_IPV4": DB_FORCE_IPV4,
         "DATABASE_URL set": bool(DB_URL),
         "DATABASE_URL (redacted)": _redact_db_url(DB_URL),
     })
@@ -894,8 +945,28 @@ def page_diagnostics():
         st.write({"IPv4": v4, "IPv6": v6})
 
         st.subheader("Connection test")
+        # Try explicit IPv4 (if available), then normal
+        tried = []
+        conn = None
         try:
-            conn = get_conn()
+            if v4:
+                tried.append("ipv4")
+                import psycopg2
+                uqs = parse_qs(u.query or "")
+                kwargs = {
+                    "dbname": (u.path[1:] or "postgres"),
+                    "user": unquote(u.username) if u.username else None,
+                    "password": unquote(u.password) if u.password else None,
+                    "host": host,
+                    "port": port,
+                    "sslmode": uqs.get("sslmode", ["require"])[0],
+                    "connect_timeout": 10,
+                    "hostaddr": v4[0],
+                }
+                conn = psycopg2.connect(**kwargs)
+            else:
+                tried.append("normal")
+                conn = get_conn()
             cur = conn.cursor()
             cur.execute("SELECT version()")
             version = cur.fetchone()[0]
@@ -903,9 +974,17 @@ def page_diagnostics():
             dbname, dbuser = cur.fetchone()
             cur.execute("SELECT NOW()")
             now = cur.fetchone()[0]
-            st.success("Connected to Postgres successfully.")
+            st.success(f"Connected to Postgres successfully via: {tried[-1]}")
             st.write({"version": version, "current_database": dbname, "current_user": dbuser, "now": str(now)})
-            conn.close()
+        except Exception as e:
+            st.error(f"Postgres connection failed. Tried paths: {tried or ['normal']}")
+            st.exception(e)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
         except Exception as e:
             st.error("Postgres connection failed.")
             st.exception(e)
